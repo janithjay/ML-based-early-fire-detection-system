@@ -4,6 +4,7 @@
 #include <Adafruit_Sensor.h>
 #include <Adafruit_BMP085_U.h>
 #include <LiquidCrystal_I2C.h>
+#include <math.h>
 
 // === Sensor Objects ===
 DFRobot_ENS160_I2C ens160(&Wire, 0x53);    // ENS160 I2C address
@@ -25,6 +26,21 @@ LiquidCrystal_I2C lcd(0x27, 16, 4);        // LCD 16x4 I2C
 
 // === Variables ===
 sensors_event_t humidity, temp, pressure_event;
+
+// Fire prediction model coefficients (from logistic regression)
+const int NUM_FEATURES = 6;
+float coefficients[NUM_FEATURES] = {
+  -0.0171457133,   // Temperature
+   0.104593380,    // Humidity
+  -0.0000933794,   // eCO2
+   0.004220319,    // Raw H2
+  -0.003014697,    // Raw Ethanol
+   0.001303010     // Pressure
+};
+float intercept = 0.0000134189;
+
+// Fire prediction result
+int fireRisk = 0;  // 0 = No fire risk, 1 = Fire risk detected
 
 // Gas sensor data variables
 int mq8_raw = 0;          // MQ8 data from multiplexer channel 1
@@ -108,6 +124,20 @@ void loop() {
   // Read all sensors
   readAllSensors();
   
+  // Calculate BME688 equivalents for gas sensors
+  long mq8_bme_eq = MQ8_BME_min + (long)mq8_raw * (MQ8_BME_max - MQ8_BME_min) / 1023;
+  long mq3_bme_eq = MQ3_BME_min + (long)mq3_raw * (MQ3_BME_max - MQ3_BME_min) / 1023;
+  
+  // Predict fire risk using real sensor readings
+  fireRisk = predictFireRisk(
+    temp.temperature,                    // Temperature
+    humidity.relative_humidity,          // Humidity
+    (float)ens160.getECO2(),            // eCO2
+    (float)mq8_bme_eq,                  // Raw H2 (BME equivalent)
+    (float)mq3_bme_eq,                  // Raw Ethanol (BME equivalent)
+    pressure_event.pressure             // Pressure
+  );
+  
   // Display on Serial Monitor
   printToSerial();
   
@@ -154,6 +184,20 @@ void readGasSensors() {
   mq8_raw = readMuxChannel(MQ8_CHANNEL);
 }
 
+// Fire prediction function using logistic regression
+int predictFireRisk(float temperature, float humidity, float eco2, float rawH2, float rawEthanol, float pressure) {
+  float features[NUM_FEATURES] = {temperature, humidity, eco2, rawH2, rawEthanol, pressure};
+  
+  float z = intercept;
+  for (int i = 0; i < NUM_FEATURES; i++) {
+    z += coefficients[i] * features[i];
+  }
+  
+  float prob = 1.0 / (1.0 + exp(-z));  // sigmoid function
+  Serial.print("Probability: "); Serial.println(prob);
+  return (prob >= 0.9) ? 1 : 0;        // threshold of 0.9 for fire risk
+}
+
 void printToSerial() {
   // Print all sensor readings to Serial Monitor
   Serial.println("=== Sensor Readings ===");
@@ -167,15 +211,22 @@ void printToSerial() {
   Serial.print("eCO2: "); Serial.print(eco2); Serial.println(" ppm");
   Serial.print("TVOC: "); Serial.print(tvoc); Serial.println(" ppb");
   
-  // Gas sensors
-  // Calculate BME688 equivalents
+  // Calculate BME688 equivalents for gas sensors
   long mq8_bme_eq = MQ8_BME_min + (long)mq8_raw * (MQ8_BME_max - MQ8_BME_min) / 1023;
   long mq3_bme_eq = MQ3_BME_min + (long)mq3_raw * (MQ3_BME_max - MQ3_BME_min) / 1023;
-  
+
   Serial.print("MQ8 (H2) Raw: "); Serial.print(mq8_raw);
   Serial.print(" | BME Equivalent: "); Serial.println(mq8_bme_eq);
   Serial.print("MQ3 (Ethanol) Raw: "); Serial.print(mq3_raw);
   Serial.print(" | BME Equivalent: "); Serial.println(mq3_bme_eq);
+  
+  // Fire risk prediction result
+  Serial.print("FIRE RISK PREDICTION: ");
+  if (fireRisk == 1) {
+    Serial.println("*** FIRE RISK DETECTED ***");
+  } else {
+    Serial.println("No fire risk detected");
+  }
   Serial.println("========================");
 }
 
@@ -186,7 +237,7 @@ void updateLCDDisplay() {
   long mq8_bme_eq = MQ8_BME_min + (long)mq8_raw * (MQ8_BME_max - MQ8_BME_min) / 1023;
   long mq3_bme_eq = MQ3_BME_min + (long)mq3_raw * (MQ3_BME_max - MQ3_BME_min) / 1023;
   
-  // Display all sensor values on one screen
+  // Display sensor values and fire risk status
   // Line 1: Temperature and Humidity
   lcd.setCursor(0, 0);
   lcd.print("Tem:"); lcd.print(temp.temperature, 1); 
@@ -202,7 +253,13 @@ void updateLCDDisplay() {
   lcd.print("TVOC:"); lcd.print(ens160.getTVOC());
   lcd.print("    H2:"); lcd.print(mq8_bme_eq);
   
-  // Line 4: MQ3 (Ethanol/Alcohol via multiplexer)
+  // Line 4: Fire Risk Status
   lcd.setCursor(0, 3);
-  lcd.print("Ethanol:"); lcd.print(mq3_bme_eq);
+  lcd.print("Eth:"); lcd.print(mq3_bme_eq);
+  lcd.setCursor(11, 3);
+  if (fireRisk == 1) {
+    lcd.print("FIRE");
+  } else {
+    lcd.print("No Fire");
+  }
 }
