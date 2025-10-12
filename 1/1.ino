@@ -1,0 +1,246 @@
+/*#include <Wire.h>
+#include <DFRobot_ENS160.h>
+#include <Adafruit_AHTX0.h>
+#include <Adafruit_BMP085_U.h>
+#include <LiquidCrystal_I2C.h>
+#include <math.h>
+
+// === Sensor Objects ===
+DFRobot_ENS160_I2C ens160(&Wire, 0x53);    // ENS160 I2C address (confirm with scanner)
+Adafruit_AHTX0 aht;                         // AHT21 temperature & humidity
+Adafruit_BMP085_Unified bmp = Adafruit_BMP085_Unified(10085); // BMP180 pressure
+LiquidCrystal_I2C lcd(0x27, 16, 4);        // LCD 16x4 I2C
+
+// === Pin Definitions (ESP32) ===
+// Use ADC1 pins for analog reads (ADC1: GPIO32..GPIO39). Recommended: GPIO34 for SIG.
+#define MUX_S0 13        // select bit 0
+#define MUX_S1 14        // select bit 1
+#define MUX_S2 27        // select bit 2
+#define MUX_S3 26        // select bit 3
+#define MUX_SIG 34       // CD74HC4067 SIG -> ADC1 channel (input-only)
+
+// Multiplexer channels for sensors
+#define MQ3_CHANNEL 0    // MQ3 connected to channel 0 (C0)
+#define MQ8_CHANNEL 1    // MQ8 connected to channel 1 (C1)
+
+// === ADC configuration ===
+const int ADC_MAX = 4095; // ESP32 12-bit ADC (0..4095)
+
+// === Variables ===
+sensors_event_t humidity, temp, pressure_event;
+
+// Fire prediction model coefficients (from logistic regression)
+const int NUM_FEATURES = 6;
+float coefficients[NUM_FEATURES] = {
+  -0.0171457133,   // Temperature
+   0.104593380,    // Humidity
+  -0.0000933794,   // eCO2
+   0.004220319,    // Raw H2
+  -0.003014697,    // Raw Ethanol
+   0.001303010     // Pressure
+};
+float intercept = 0.0000134189;
+
+// Fire prediction result
+int fireRisk = 0;  // 0 = No fire risk, 1 = Fire risk detected
+
+// Gas sensor data variables
+int mq8_raw = 0;          // MQ8 data from multiplexer channel 1
+int mq3_raw = 0;          // MQ3 data from multiplexer channel 0
+
+// Gas sensor calibration parameters (keep these as your calibrated values)
+int MQ8_BME_min = 10700;  // minimum raw H2 value equivalent
+int MQ8_BME_max = 13800;  // maximum raw H2 value equivalent
+
+int MQ3_BME_min = 15300;  // minimum raw ethanol value equivalent
+int MQ3_BME_max = 21400;  // maximum raw ethanol value equivalent
+
+void setup() {
+  Serial.begin(115200);
+  delay(50);
+
+  // Initialize I2C for ESP32 (SDA=21, SCL=22)
+  Wire.begin(21, 22);   // SDA, SCL
+
+  // Initialize multiplexer control pins
+  pinMode(MUX_S0, OUTPUT);
+  pinMode(MUX_S1, OUTPUT);
+  pinMode(MUX_S2, OUTPUT);
+  pinMode(MUX_S3, OUTPUT);
+
+  // For analog input, set attenuation so 0..3.3V maps to 0..4095
+  analogSetPinAttenuation(MUX_SIG, ADC_11db); // function available in ESP32 Arduino core
+
+  // LCD setup
+  lcd.init();
+  lcd.backlight();
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Multi-Sensor");
+  lcd.setCursor(0, 1);
+  lcd.print("Smoke Detection");
+  lcd.setCursor(0, 2);
+  lcd.print("System Starting...");
+  delay(2000);
+  lcd.clear();
+
+  // Initialize AHT21
+  if (!aht.begin()) {
+    Serial.println("AHT21 not found!");
+    lcd.setCursor(0, 0);
+    lcd.print("AHT21 Error!");
+    while (1);
+  }
+  Serial.println("AHT21 initialized successfully");
+
+  // Initialize BMP180
+  if(!bmp.begin()) {
+    Serial.println("BMP180 not found!");
+    lcd.setCursor(0, 1);
+    lcd.print("BMP180 Error!");
+    while(1);
+  }
+  Serial.println("BMP180 initialized successfully");
+
+  // Initialize ENS160
+  if (ens160.begin() != NO_ERR) {
+    Serial.println("ENS160 not found!");
+    lcd.setCursor(0, 2);
+    lcd.print("ENS160 Error!");
+    while (1);
+  }
+  Serial.println("ENS160 initialized successfully");
+
+  // Configure ENS160
+  ens160.setPWRMode(ENS160_STANDARD_MODE);
+  ens160.setTempAndHum(25.0, 50.0);  // initial values
+  
+  Serial.println("All sensors initialized successfully!");
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("All Sensors Ready");
+  delay(1500);
+  lcd.clear();
+}
+
+void loop() {
+  // Read all sensors
+  readAllSensors();
+  
+  // Calculate BME688 equivalents for gas sensors (use ADC_MAX for ESP32)
+  long mq8_bme_eq = MQ8_BME_min + (long)mq8_raw * (MQ8_BME_max - MQ8_BME_min) / ADC_MAX;
+  long mq3_bme_eq = MQ3_BME_min + (long)mq3_raw * (MQ3_BME_max - MQ3_BME_min) / ADC_MAX;
+  
+  // Predict fire risk using real sensor readings
+  fireRisk = predictFireRisk(
+    temp.temperature,                    // Temperature
+    humidity.relative_humidity,          // Humidity
+    (float)ens160.getECO2(),            // eCO2
+    (float)mq8_bme_eq,                  // Raw H2 (BME equivalent)
+    (float)mq3_bme_eq,                  // Raw Ethanol (BME equivalent)
+    pressure_event.pressure             // Pressure
+  );
+  
+  // Display on Serial Monitor
+  printToSerial();
+  
+  // Update LCD display
+  updateLCDDisplay();
+  
+  delay(2000);  // Update every 2 seconds
+}
+
+void readAllSensors() {
+  // Read AHT21 (temperature and humidity)
+  aht.getEvent(&humidity, &temp);
+  
+  // Read BMP180 (pressure)
+  bmp.getEvent(&pressure_event);
+  
+  // Update ENS160 with current temp/humidity for better accuracy
+  ens160.setTempAndHum(temp.temperature, humidity.relative_humidity);
+  
+  // Read MQ3 and MQ8 sensors via multiplexer
+  readGasSensors();
+}
+
+void selectMuxChannel(int channel) {
+  // Set the 4-bit channel selection (S3, S2, S1, S0)
+  digitalWrite(MUX_S0, (channel & 0x01) ? HIGH : LOW);
+  digitalWrite(MUX_S1, (channel & 0x02) ? HIGH : LOW);
+  digitalWrite(MUX_S2, (channel & 0x04) ? HIGH : LOW);
+  digitalWrite(MUX_S3, (channel & 0x08) ? HIGH : LOW);
+  
+  delay(5); // Small delay for multiplexer to settle
+}
+
+int readMuxChannel(int channel) {
+  selectMuxChannel(channel);
+  // analogRead on ESP32 returns 0..4095 (with ADC_11db attenuation)
+  return analogRead(MUX_SIG);
+}
+
+void readGasSensors() {
+  mq3_raw = readMuxChannel(MQ3_CHANNEL);
+  mq8_raw = readMuxChannel(MQ8_CHANNEL);
+}
+
+int predictFireRisk(float temperature, float humidity, float eco2, float rawH2, float rawEthanol, float pressure) {
+  float features[NUM_FEATURES] = {temperature, humidity, eco2, rawH2, rawEthanol, pressure};
+  
+  float z = intercept;
+  for (int i = 0; i < NUM_FEATURES; i++) {
+    z += coefficients[i] * features[i];
+  }
+  
+  float prob = 1.0 / (1.0 + exp(-z));  // sigmoid function
+  Serial.print("Probability: "); Serial.println(prob);
+  return (prob >= 0.9) ? 1 : 0;        // threshold of 0.9 for fire risk
+}
+
+void printToSerial() {
+  Serial.println("=== Sensor Readings ===");
+  Serial.print("Temperature: "); Serial.print(temp.temperature, 1); Serial.println(" °C");
+  Serial.print("Humidity: "); Serial.print(humidity.relative_humidity, 1); Serial.println(" %");
+  Serial.print("Pressure: "); Serial.print(pressure_event.pressure, 1); Serial.println(" hPa");
+  uint16_t eco2 = ens160.getECO2();
+  uint16_t tvoc = ens160.getTVOC();
+  Serial.print("eCO2: "); Serial.print(eco2); Serial.println(" ppm");
+  Serial.print("TVOC: "); Serial.print(tvoc); Serial.println(" ppb");
+  long mq8_bme_eq = MQ8_BME_min + (long)mq8_raw * (MQ8_BME_max - MQ8_BME_min) / ADC_MAX;
+  long mq3_bme_eq = MQ3_BME_min + (long)mq3_raw * (MQ3_BME_max - MQ3_BME_min) / ADC_MAX;
+  Serial.print("MQ8 (H2) Raw: "); Serial.print(mq8_raw);
+  Serial.print(" | BME Equivalent: "); Serial.println(mq8_bme_eq);
+  Serial.print("MQ3 (Ethanol) Raw: "); Serial.print(mq3_raw);
+  Serial.print(" | BME Equivalent: "); Serial.println(mq3_bme_eq);
+  Serial.print("FIRE RISK PREDICTION: ");
+  if (fireRisk == 1) {
+    Serial.println("*** FIRE RISK DETECTED ***");
+  } else {
+    Serial.println("No fire risk detected");
+  }
+  Serial.println("========================");
+}
+
+void updateLCDDisplay() {
+  lcd.clear();
+  long mq8_bme_eq = MQ8_BME_min + (long)mq8_raw * (MQ8_BME_max - MQ8_BME_min) / ADC_MAX;
+  long mq3_bme_eq = MQ3_BME_min + (long)mq3_raw * (MQ3_BME_max - MQ3_BME_min) / ADC_MAX;
+  lcd.setCursor(0, 0);
+  lcd.print("Tem:"); lcd.print(temp.temperature, 1); 
+  lcd.print("C  Humi:"); lcd.print(humidity.relative_humidity, 0); lcd.print("%");
+  lcd.setCursor(0, 1);
+  lcd.print("Pres:"); lcd.print(pressure_event.pressure, 0);
+  lcd.print("  CO2:"); lcd.print(ens160.getECO2());
+  lcd.setCursor(0, 2);
+  lcd.print("TVOC:"); lcd.print(ens160.getTVOC());
+  lcd.print("    H2:"); lcd.print(mq8_bme_eq);
+  lcd.setCursor(0, 3);
+  lcd.print("Eth:"); lcd.print(mq3_bme_eq);
+  lcd.setCursor(11, 3);
+  if (fireRisk == 1) {
+    lcd.print("FIRE");
+  } else {
+    lcd.print("No Fire");
+  }
+}*/
