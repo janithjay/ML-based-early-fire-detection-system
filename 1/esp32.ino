@@ -88,16 +88,36 @@ int mq3_raw = 0;
 // Set to true to test with known values, false for live sensor readings
 #define TEST_MODE true
 
-// Test data from your example (Fire Alarm = 1)
-const float TEST_DATA[6] = {
-  10.002,   // Temperature [°C]
-  52.55,    // Humidity [%]
-  631,      // eCO2 [ppm]
-  12802,    // Raw H2
-  19471,    // Raw Ethanol
-  939.097   // Pressure [hPa]
+// Test dataset: Multiple samples to simulate sensor readings over time
+const int NUM_TEST_SAMPLES = 20;
+int current_test_index = 0;
+
+// Test data samples (Fire cases: samples 0-10, No Fire cases: samples 11-19)
+const float TEST_DATASET[20][7] = {
+  // Fire cases (Expected: 1)
+  {10.002, 52.55, 631, 12802, 19471, 939.097, 1},
+  {10.014, 52.67, 630, 12802, 19480, 939.107, 1},
+  {10.025, 52.80, 637, 12801, 19470, 939.107, 1},
+  {10.036, 52.94, 634, 12802, 19462, 939.117, 1},
+  {10.047, 53.07, 645, 12802, 19463, 939.105, 1},
+  {10.058, 53.15, 635, 12806, 19475, 939.110, 1},
+  {10.069, 53.24, 643, 12799, 19470, 939.110, 1},
+  {10.080, 53.29, 626, 12802, 19477, 939.107, 1},
+  {10.091, 53.39, 630, 12803, 19472, 939.119, 1},
+  {10.102, 53.46, 625, 12799, 19470, 939.115, 1},
+  {10.114, 53.52, 639, 12797, 19463, 939.109, 1},
+  
+  // No Fire cases (Expected: 0)
+  {20.000, 57.36, 400, 12306, 18520, 939.735, 0},
+  {20.015, 56.67, 400, 12345, 18651, 939.744, 0},
+  {20.029, 55.96, 400, 12374, 18764, 939.738, 0},
+  {20.044, 55.28, 400, 12390, 18849, 939.736, 0},
+  {20.059, 54.69, 400, 12403, 18921, 939.744, 0},
+  {20.073, 54.12, 400, 12419, 18998, 939.725, 0},
+  {20.088, 53.61, 400, 12432, 19058, 939.738, 0},
+  {20.103, 53.20, 400, 12439, 19114, 939.758, 0},
+  {20.117, 52.81, 400, 12448, 19155, 939.758, 0}
 };
-const int TEST_EXPECTED_RESULT = 1; // Expected: Fire Alarm = 1
 
 // ====== FUNCTION DECLARATIONS ======
 void readAllSensors();
@@ -212,21 +232,40 @@ void setup() {
 void loop() {
   float raw_features[6];
   long mq8_bme_eq, mq3_bme_eq;
+  int expected_result = 0;
 
 #if TEST_MODE
-  // ========== TEST MODE: Use predefined values ==========
-  Serial.println("\n***** TEST MODE ENABLED *****");
-  Serial.println("Using example data from table:");
+  // ========== TEST MODE: Simulate sensor readings with test data ==========
+  Serial.println("\n╔════════════════════════════════════════════╗");
+  Serial.println("║       TEST MODE - SIMULATED READING        ║");
+  Serial.println("╚════════════════════════════════════════════╝");
+  Serial.printf("Sample %d of %d\n", current_test_index + 1, NUM_TEST_SAMPLES);
   
-  // Use test data directly
-  for (int i = 0; i < 6; i++) {
-    raw_features[i] = TEST_DATA[i];
+  // Get current test sample
+  const float* sample = TEST_DATASET[current_test_index];
+  
+  // Extract features from test data
+  raw_features[0] = sample[0]; // Temperature
+  raw_features[1] = sample[1]; // Humidity
+  raw_features[2] = sample[2]; // eCO2
+  raw_features[3] = sample[3]; // H2
+  raw_features[4] = sample[4]; // Ethanol
+  raw_features[5] = sample[5]; // Pressure
+  
+  mq8_bme_eq = (long)sample[3];
+  mq3_bme_eq = (long)sample[4];
+  expected_result = (int)sample[6];
+  
+  Serial.printf("Expected Result: Fire Alarm = %d\n", expected_result);
+  if (expected_result == 1) {
+    Serial.println("Category: FIRE CASE");
+  } else {
+    Serial.println("Category: NO FIRE CASE");
   }
-  mq8_bme_eq = (long)TEST_DATA[3];
-  mq3_bme_eq = (long)TEST_DATA[4];
+  Serial.println("────────────────────────────────────────────\n");
   
-  Serial.printf("Expected Result: Fire Alarm = %d\n", TEST_EXPECTED_RESULT);
-  Serial.println("*****************************\n");
+  // Move to next sample (loop back to start)
+  current_test_index = (current_test_index + 1) % NUM_TEST_SAMPLES;
 #else
   // ========== LIVE MODE: Read from sensors ==========
   readAllSensors();
@@ -327,16 +366,22 @@ void loop() {
   
 #if TEST_MODE
   // Validate test result
-  Serial.println("\n--- TEST VALIDATION ---");
-  Serial.printf(" Expected: Fire Alarm = %d\n", TEST_EXPECTED_RESULT);
-  Serial.printf(" Actual:   Fire Alarm = %d\n", risk);
-  if (risk == TEST_EXPECTED_RESULT) {
-    Serial.println(" ✓ TEST PASSED - Model output matches expected result!");
+  Serial.println("\n╔════════════════════════════════════════════╗");
+  Serial.println("║           TEST VALIDATION                  ║");
+  Serial.println("╚════════════════════════════════════════════╝");
+  Serial.printf(" Expected Output: Fire Alarm = %d\n", expected_result);
+  Serial.printf(" Model Prediction: Fire Alarm = %d\n", risk);
+  Serial.println("────────────────────────────────────────────");
+  
+  if (risk == expected_result) {
+    Serial.println(" ✓✓✓ TEST PASSED ✓✓✓");
+    Serial.println(" Model output MATCHES expected result!");
   } else {
-    Serial.println(" ✗ TEST FAILED - Model output does NOT match expected result!");
-    Serial.println(" Check: quantization parameters, normalization, or model file");
+    Serial.println(" ✗✗✗ TEST FAILED ✗✗✗");
+    Serial.println(" Model output DOES NOT match expected!");
+    Serial.println(" → Check: quantization, normalization, model");
   }
-  Serial.println("-----------------------");
+  Serial.println("════════════════════════════════════════════\n");
 #endif
   
   Serial.println("====================================\n");
