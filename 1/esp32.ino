@@ -2,8 +2,8 @@
   ESP32 Fire Detection - TFLite INT8 Model Inference (Real Sensors)
   - Reads sensors: AHT (temp/hum), BMP180 (pressure), ENS160 (eCO2), MQ3, MQ8
   - Runs TFLite quantized model for fire detection
+  - Pre-processing includes Standardization (Z-score normalization) before Quantization
   - Feature order: [eCO2, Humidity, Pressure, Raw_Ethanol, Raw_H2, Temperature]
-  - Model input/output already normalized (mean≈0, std=1)
 */
 
 #include <Arduino.h>
@@ -41,8 +41,19 @@ const int INPUT_ZERO_POINT = -23;
 const float OUTPUT_SCALE = 0.00390625f;
 const int OUTPUT_ZERO_POINT = -128;
 
-// Model input is already standardized: mean ≈ 0, std = 1
-// No additional normalization needed
+// ===============================================
+// Standardization parameters (FROM YOUR TRAINING DATASET)
+// These values are now correctly populated.
+// Order: [eCO2, Humidity, Pressure, Raw_Ethanol, Raw_H2, Temperature]
+// ===============================================
+const float FEATURE_MEANS[6] = {
+    1290.20526961f, 53.63631331f, 1006.08489930f, 2993.15093954f, 115.52450980f, 41.12098688f
+};
+
+const float FEATURE_STDS[6] = {
+    2689.46756645f, 15.91762949f, 0.21825710f, 275.28715973f, 100.50365919f, 9.70326020f
+};
+
 
 // ====== SENSOR OBJECTS ======
 DFRobot_ENS160_I2C ens160(&Wire, 0x53);
@@ -51,8 +62,8 @@ Adafruit_BMP085_Unified bmp = Adafruit_BMP085_Unified(10085);
 LiquidCrystal_I2C lcd(0x27, 16, 4);
 
 // ====== PIN DEFINITIONS ======
-#define MQ3_PIN 34    // MQ3 (Ethanol) - Analog input
-#define MQ8_PIN 35    // MQ8 (H2) - Analog input
+#define MQ3_PIN 34      // MQ3 (Ethanol) - Analog input
+#define MQ8_PIN 35      // MQ8 (H2) - Analog input
 
 // ====== SENSOR VARIABLES ======
 sensors_event_t humidity_event, temp_event, pressure_event;
@@ -72,7 +83,7 @@ void readAllSensors();
 void readGasSensors();
 void runInference();
 void updateLCDDisplay(float temp, float hum, float press, int eco2,
-                     int h2, int ethanol, float probability, int fire_alarm);
+                      int h2, int ethanol, float probability, int fire_alarm);
 
 void setup() {
   Serial.begin(115200);
@@ -130,7 +141,7 @@ void loop() {
 
 // ====== I2C Initialization ======
 void initI2C() {
-  Wire.begin(21, 22);  // SDA = 21, SCL = 22
+  Wire.begin(21, 22);   // SDA = 21, SCL = 22
   pinMode(MQ3_PIN, INPUT);
   pinMode(MQ8_PIN, INPUT);
   analogSetPinAttenuation(MQ3_PIN, ADC_11db);
@@ -250,12 +261,12 @@ void runInference() {
   // Prepare raw sensor values in correct order:
   // [eCO2, Humidity, Pressure, Raw_Ethanol, Raw_H2, Temperature]
   float sensor_values[6] = {
-      (float)ens160.getECO2(),                    // eCO2
-      humidity_event.relative_humidity,           // Humidity
-      pressure_event.pressure,                    // Pressure
-      (float)mq3_raw,                            // Raw_Ethanol (MQ3)
-      (float)mq8_raw,                            // Raw_H2 (MQ8)
-      temp_event.temperature                     // Temperature
+      (float)ens160.getECO2(),              // eCO2
+      humidity_event.relative_humidity,     // Humidity
+      pressure_event.pressure,              // Pressure
+      (float)mq3_raw,                       // Raw_Ethanol (MQ3)
+      (float)mq8_raw,                       // Raw_H2 (MQ8)
+      temp_event.temperature                // Temperature
   };
 
   Serial.println("========== SENSOR READINGS ==========");
@@ -266,22 +277,24 @@ void runInference() {
   Serial.printf(" Raw H2 (MQ8): %.0f\n", sensor_values[4]);
   Serial.printf(" Temperature: %.2f C\n", sensor_values[5]);
 
-  // ========== QUANTIZATION ==========
-  Serial.println("\n========== QUANTIZATION ==========");
+  // ========== STANDARDIZATION & QUANTIZATION ==========
+  Serial.println("\n====== STANDARDIZE & QUANTIZE ======");
   int8_t quantized_input[6];
   
   for (int i = 0; i < 6; i++) {
-    // Model expects already-normalized input (mean≈0, std=1)
-    // So we directly quantize the sensor reading
-    float scaled = (sensor_values[i] / INPUT_SCALE) + INPUT_ZERO_POINT;
+    // 1. Standardize the sensor value (Z-score normalization)
+    float standardized_value = (sensor_values[i] - FEATURE_MEANS[i]) / FEATURE_STDS[i];
+    
+    // 2. Quantize the standardized value
+    float scaled = (standardized_value / INPUT_SCALE) + INPUT_ZERO_POINT;
     int quant_value = (int)round(scaled);
     
-    // Clamp to int8 range [-128, 127]
+    // 3. Clamp to int8 range [-128, 127]
     quantized_input[i] = (int8_t)max(-128, min(127, quant_value));
     
     const char* names[] = {"CO2", "Humid", "Press", "EtOH", "H2", "Temp"};
-    Serial.printf(" [%d] %s: %.2f -> quantized: %d\n", 
-                  i, names[i], sensor_values[i], quantized_input[i]);
+    Serial.printf(" [%d] %s: %.2f -> std: %.2f -> quant: %d\n", 
+                  i, names[i], sensor_values[i], standardized_value, quantized_input[i]);
   }
 
   // ========== INFERENCE ==========
@@ -332,13 +345,12 @@ void runInference() {
   updateLCDDisplay(temp_event.temperature, humidity_event.relative_humidity,
                    pressure_event.pressure, ens160.getECO2(),
                    mq8_raw, mq3_raw, probability, fire_alarm);
-
-  delay(1000);
 }
+
 
 // ====== Update LCD Display ======
 void updateLCDDisplay(float temp, float hum, float press, int eco2,
-                     int h2, int ethanol, float probability, int fire_alarm) {
+                      int h2, int ethanol, float probability, int fire_alarm) {
   lcd.clear();
 
   // Line 0: Temperature and Humidity
