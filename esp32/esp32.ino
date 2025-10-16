@@ -1,6 +1,7 @@
 /*
   ESP32 Fire Detection - TFLite INT8 Model with Firebase Integration
   Using Firebase Database Secret (Legacy Token) for authentication
+  WITH BUZZER ALERT SYSTEM
   
   Libraries needed:
   - Firebase ESP Client by Mobizt
@@ -80,6 +81,13 @@ LiquidCrystal_I2C lcd(0x27, 16, 4);
 // ====== PIN DEFINITIONS ======
 #define MQ3_PIN 34
 #define MQ8_PIN 35
+#define BUZZER_PIN 25  // Buzzer connected to GPIO 25
+#define TEST_BUTTON_PIN 32  // Push button for demo mode
+
+// ====== BUZZER VARIABLES ======
+bool buzzerState = false;
+unsigned long lastBuzzerToggle = 0;
+const unsigned long buzzerBeepInterval = 500;  // 500ms on, 500ms off for beep pattern
 
 // ====== SENSOR VARIABLES ======
 sensors_event_t humidity_event, temp_event, pressure_event;
@@ -95,6 +103,30 @@ const char* ntpServer = "pool.ntp.org";
 const long gmtOffset_sec = 5*3600;  // Set to your timezone offset (e.g., 5*3600 for UTC+5:30)
 const int daylightOffset_sec = 0;
 
+// ====== FIRE DETECTION STATE ======
+bool fireDetected = false;
+
+// ====== DEMO MODE VARIABLES ======
+bool demoMode = false;
+int demoDataIndex = 0;
+unsigned long lastDemoUpdate = 0;
+const unsigned long demoUpdateInterval = 3000;  // Update every 3 seconds in demo mode
+
+// Dummy fire detection data (8 samples from your dataset)
+const float DEMO_DATA[8][7] = {
+  // eco2,  humidity, pressure, raw_ethanol, raw_h2, temperature, fire_alarm
+  {3936, 61.81192, 1006.01, 3032, 293, 39.37054, 1},
+  {5753, 61.47594, 1006.00, 3036, 292, 39.87541, 1},
+  {4392, 60.59647, 1005.95, 3056, 316, 39.98394, 1},
+  {2954, 59.82027, 1005.99, 3072, 324, 40.03391, 1},
+  {2192, 59.21974, 1005.99, 3091, 321, 40.08026, 1},
+  {1802, 58.63543, 1005.93, 3091, 318, 40.05241, 1},
+  {1746, 58.03804, 1005.94, 3098, 306, 40.02628, 1},
+  {1513, 57.38468, 1005.94, 3109, 302, 40.02762, 1}
+};
+
+const int DEMO_DATA_COUNT = 8;
+
 void setup() {
   Serial.begin(115200);
   delay(1000);
@@ -102,6 +134,16 @@ void setup() {
   Serial.println("ESP32 Fire Detection System");
   Serial.println("TFLite + Firebase Integration");
   Serial.println("===========================================\n");
+
+  // Initialize Buzzer Pin (OFF by default)
+  pinMode(BUZZER_PIN, OUTPUT);
+  digitalWrite(BUZZER_PIN, LOW);
+  Serial.println("Buzzer initialized (OFF)");
+  
+  // Initialize Test Button Pin with internal pull-up
+  pinMode(TEST_BUTTON_PIN, INPUT_PULLUP);
+  Serial.println("Test button initialized (GPIO 32)");
+  Serial.println("Press button to start DEMO MODE with fire detection data");
 
   // Initialize LCD
   lcd.init();
@@ -274,15 +316,66 @@ void setup() {
 void loop() {
   unsigned long currentMillis = millis();
   
-  // Run inference every 2 seconds
-  if (currentMillis - lastInferenceTime >= inferenceInterval) {
-    lastInferenceTime = currentMillis;
+  // Check for button press to toggle demo mode
+  static bool lastButtonState = HIGH;
+  bool currentButtonState = digitalRead(TEST_BUTTON_PIN);
+  
+  if (lastButtonState == HIGH && currentButtonState == LOW) {
+    // Button pressed (pulled to ground)
+    delay(50);  // Debounce
+    demoMode = !demoMode;
+    demoDataIndex = 0;
     
-    // Read all sensors
-    readAllSensors();
-    
-    // Run ML inference
-    runInference();
+    if (demoMode) {
+      Serial.println("\n╔═══════════════════════════════════════╗");
+      Serial.println("║     🔥 DEMO MODE ACTIVATED 🔥         ║");
+      Serial.println("║  Using Pre-recorded Fire Data         ║");
+      Serial.println("╚═══════════════════════════════════════╝\n");
+      lcd.clear();
+      lcd.setCursor(0, 0);
+      lcd.print("DEMO MODE");
+      lcd.setCursor(0, 1);
+      lcd.print("Fire Data Test");
+      delay(2000);
+    } else {
+      Serial.println("\n✓ Demo mode deactivated - Returning to live sensors\n");
+      // Turn off buzzer when exiting demo
+      fireDetected = false;
+      digitalWrite(BUZZER_PIN, LOW);
+      lcd.clear();
+      lcd.setCursor(0, 0);
+      lcd.print("Live Mode");
+      lcd.setCursor(0, 1);
+      lcd.print("Active");
+      delay(2000);
+    }
+  }
+  lastButtonState = currentButtonState;
+  
+  // Handle buzzer beeping pattern when fire is detected
+  if (fireDetected) {
+    if (currentMillis - lastBuzzerToggle >= buzzerBeepInterval) {
+      lastBuzzerToggle = currentMillis;
+      buzzerState = !buzzerState;
+      digitalWrite(BUZZER_PIN, buzzerState ? HIGH : LOW);
+    }
+  }
+  
+  // Run inference based on mode
+  if (demoMode) {
+    // Demo mode - cycle through dummy data
+    if (currentMillis - lastDemoUpdate >= demoUpdateInterval) {
+      lastDemoUpdate = currentMillis;
+      runDemoInference();
+      demoDataIndex = (demoDataIndex + 1) % DEMO_DATA_COUNT;
+    }
+  } else {
+    // Normal mode - read live sensors
+    if (currentMillis - lastInferenceTime >= inferenceInterval) {
+      lastInferenceTime = currentMillis;
+      readAllSensors();
+      runInference();
+    }
   }
 }
 
@@ -371,6 +464,22 @@ void runInference() {
                 probability * 100.0f, 
                 fire_alarm ? "FIRE RISK!" : "Safe");
   Serial.println("======================================\n");
+
+  // Update fire detection state and buzzer
+  if (fire_alarm == 1 && !fireDetected) {
+    // Fire just detected - start buzzer
+    fireDetected = true;
+    buzzerState = true;
+    digitalWrite(BUZZER_PIN, HIGH);
+    lastBuzzerToggle = millis();
+    Serial.println("🔥 FIRE DETECTED - BUZZER ACTIVATED!");
+  } else if (fire_alarm == 0 && fireDetected) {
+    // Fire cleared - stop buzzer
+    fireDetected = false;
+    buzzerState = false;
+    digitalWrite(BUZZER_PIN, LOW);
+    Serial.println("✓ Fire cleared - Buzzer deactivated");
+  }
 
   // Update LCD
   updateLCD(sensor_values[5], sensor_values[1], sensor_values[2], 
@@ -492,4 +601,85 @@ void updateLCD(float temp, float hum, float press, int eco2,
   } else {
     lcd.print("SAFE");
   }
+}
+
+// ====== Run Demo Inference with Dummy Data ======
+void runDemoInference() {
+  // Get current dummy data
+  float eco2 = DEMO_DATA[demoDataIndex][0];
+  float hum = DEMO_DATA[demoDataIndex][1];
+  float press = DEMO_DATA[demoDataIndex][2];
+  int ethanol = (int)DEMO_DATA[demoDataIndex][3];
+  int h2 = (int)DEMO_DATA[demoDataIndex][4];
+  float temp = DEMO_DATA[demoDataIndex][5];
+  int expected_fire = (int)DEMO_DATA[demoDataIndex][6];
+  
+  // Prepare sensor values for model
+  float sensor_values[6] = {
+      eco2,
+      hum,
+      press,
+      (float)ethanol,
+      (float)h2,
+      temp
+  };
+
+  // Print sensor readings
+  Serial.println("========== DEMO DATA [" + String(demoDataIndex + 1) + "/8] ==========");
+  Serial.printf("Temperature:   %.2f °C\n", temp);
+  Serial.printf("Humidity:      %.2f %%\n", hum);
+  Serial.printf("Pressure:      %.2f hPa\n", press);
+  Serial.printf("eCO2:          %.0f ppm\n", eco2);
+  Serial.printf("H2 (MQ8):      %d\n", h2);
+  Serial.printf("Ethanol (MQ3): %d\n", ethanol);
+  Serial.printf("Expected:      FIRE (Label=1)\n");
+
+  // Standardize & Quantize
+  int8_t quantized_input[6];
+  for (int i = 0; i < 6; i++) {
+    float std_val = (sensor_values[i] - FEATURE_MEANS[i]) / FEATURE_STDS[i];
+    float scaled = (std_val / INPUT_SCALE) + INPUT_ZERO_POINT;
+    quantized_input[i] = (int8_t)constrain((int)round(scaled), -128, 127);
+  }
+
+  // Run inference
+  memcpy(input->data.int8, quantized_input, sizeof(quantized_input));
+  
+  if (interpreter->Invoke() != kTfLiteOk) {
+    Serial.println("ERROR: Inference failed!");
+    return;
+  }
+
+  // Get result
+  int8_t raw_output = output->data.int8[0];
+  float probability = (raw_output - OUTPUT_ZERO_POINT) * OUTPUT_SCALE;
+  probability = constrain(probability, 0.0f, 1.0f);
+  int fire_alarm = (probability > 0.5f) ? 1 : 0;
+
+  Serial.println("\n========== DEMO INFERENCE RESULT ==========");
+  Serial.printf("Fire Probability: %.2f%% (%s)\n", 
+                probability * 100.0f, 
+                fire_alarm ? "🔥 FIRE DETECTED!" : "Safe");
+  Serial.printf("Model Prediction: %s\n", fire_alarm ? "CORRECT ✓" : "INCORRECT ✗");
+  Serial.println("==========================================\n");
+
+  // Update fire detection state and buzzer
+  if (fire_alarm == 1 && !fireDetected) {
+    fireDetected = true;
+    buzzerState = true;
+    digitalWrite(BUZZER_PIN, HIGH);
+    lastBuzzerToggle = millis();
+    Serial.println("🔥 DEMO: FIRE DETECTED - BUZZER ACTIVATED!");
+  } else if (fire_alarm == 0 && fireDetected) {
+    fireDetected = false;
+    buzzerState = false;
+    digitalWrite(BUZZER_PIN, LOW);
+    Serial.println("✓ Demo: Fire cleared - Buzzer deactivated");
+  }
+
+  // Update LCD
+  updateLCD(temp, hum, press, (int)eco2, h2, ethanol, probability, fire_alarm);
+
+  // Send to Firebase (optional in demo mode - comment out if not needed)
+  sendToFirebase(temp, hum, press, (int)eco2, h2, ethanol, probability, fire_alarm);
 }
