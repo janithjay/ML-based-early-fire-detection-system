@@ -9,6 +9,7 @@
   - Adafruit BMP085 Unified
   - LiquidCrystal I2C
   - TensorFlow Lite Micro
+  - Time library (built-in)
 */
 
 #include <Arduino.h>
@@ -20,6 +21,7 @@
 #include <Adafruit_BMP085_U.h>
 #include <LiquidCrystal_I2C.h>
 #include <math.h>
+#include <time.h>
 
 #include "addons/TokenHelper.h"
 #include "addons/RTDBHelper.h"
@@ -34,13 +36,8 @@
 #define WIFI_PASSWORD "15448192"
 
 // ==================== Firebase Configuration ====================
-// Get your Database Secret from: Firebase Console → Project Settings → Service Accounts → Database Secrets
 #define DATABASE_URL "https://firely-50a30-default-rtdb.asia-southeast1.firebasedatabase.app/"
-#define DATABASE_SECRET "h6iRd4cv0jcYsaYs3k8Im2u85N3nrgsfMkXQsOTE"  // Replace with actual secret from Firebase Console
-
-// If you don't have Database Secret, use this alternative approach
-// Set Firebase Rules to: { "rules": { ".read": true, ".write": true } }
-// Then leave DATABASE_SECRET as empty string: ""
+#define DATABASE_SECRET "h6iRd4cv0jcYsaYs3k8Im2u85N3nrgsfMkXQsOTE"
 
 // Firebase objects
 FirebaseData fbdo;
@@ -93,6 +90,11 @@ int mq3_raw = 0;
 unsigned long lastInferenceTime = 0;
 const unsigned long inferenceInterval = 2000;  // 2 seconds
 
+// ====== NTP TIME CONFIGURATION ======
+const char* ntpServer = "pool.ntp.org";
+const long gmtOffset_sec = 5*3600;  // Set to your timezone offset (e.g., 5*3600 for UTC+5:30)
+const int daylightOffset_sec = 0;
+
 void setup() {
   Serial.begin(115200);
   delay(1000);
@@ -133,6 +135,33 @@ void setup() {
   lcd.setCursor(0, 1);
   lcd.print(WiFi.localIP());
   delay(2000);
+
+  // ====== Sync Time with NTP ======
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Syncing Time...");
+  
+  Serial.println("Syncing time with NTP server...");
+  configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
+  
+  // Wait for time to be set
+  time_t now = time(nullptr);
+  int attempts = 0;
+  while (now < 24 * 3600 && attempts < 20) {
+    delay(500);
+    Serial.print(".");
+    now = time(nullptr);
+    attempts++;
+  }
+  Serial.println();
+  
+  struct tm timeinfo = *localtime(&now);
+  Serial.print("Current time: ");
+  Serial.println(asctime(&timeinfo));
+  
+  lcd.setCursor(0, 1);
+  lcd.print("Time Synced!");
+  delay(1000);
 
   // ====== Initialize I2C and GPIO ======
   Wire.begin(21, 22);
@@ -212,17 +241,12 @@ void setup() {
   
   Serial.println("Initializing Firebase...");
   
-  /* Assign the RTDB URL (required) */
   config.database_url = DATABASE_URL;
-  
-  /* Assign the database secret (legacy token) */
   config.signer.tokens.legacy_token = DATABASE_SECRET;
   
-  /* Initialize Firebase without authentication */
   Firebase.begin(&config, &auth);
   Firebase.reconnectWiFi(true);
   
-  // Set SSL buffer size
   fbdo.setBSSLBufferSize(1024, 1024);
   
   Serial.println("Firebase initialized!");
@@ -260,6 +284,26 @@ void loop() {
     // Run ML inference
     runInference();
   }
+}
+
+// ====== Get Formatted Date and Time ======
+String getFormattedDateTime() {
+  time_t now = time(nullptr);
+  struct tm* timeinfo = localtime(&now);
+  
+  char buffer[30];
+  strftime(buffer, sizeof(buffer), "%Y-%m-%d %H:%M:%S", timeinfo);
+  return String(buffer);
+}
+
+// ====== Get Date Only (for organizing in Firebase) ======
+String getDateOnly() {
+  time_t now = time(nullptr);
+  struct tm* timeinfo = localtime(&now);
+  
+  char buffer[15];
+  strftime(buffer, sizeof(buffer), "%Y-%m-%d", timeinfo);
+  return String(buffer);
 }
 
 // ====== Read All Sensors ======
@@ -346,7 +390,12 @@ void sendToFirebase(float temp, float hum, float press, int eco2,
   
   Serial.println(">>> Uploading to Firebase...");
   
-  unsigned long timestamp = millis();
+  // Get formatted date and time
+  String dateTime = getFormattedDateTime();
+  String dateOnly = getDateOnly();
+  unsigned long timestamp = time(nullptr);
+  
+  Serial.println("Timestamp: " + dateTime);
   
   // Create JSON with all sensor data
   FirebaseJson json;
@@ -358,7 +407,8 @@ void sendToFirebase(float temp, float hum, float press, int eco2,
   json.set("rawEthanol", ethanol);
   json.set("fireProbability", probability);
   json.set("fireAlarm", fire_alarm);
-  json.set("timestamp", timestamp);
+  json.set("dateTime", dateTime);           // Human-readable date and time
+  json.set("unixTimestamp", timestamp);     // For sorting/filtering
 
   // Update current sensor readings
   if (Firebase.RTDB.setJSON(&fbdo, "sensors/current", &json)) {
@@ -369,29 +419,32 @@ void sendToFirebase(float temp, float hum, float press, int eco2,
     Serial.println("  REASON: " + fbdo.errorReason());
   }
 
-  // Add to history with timestamp
-  String historyPath = "sensors/history/" + String(timestamp);
+  // Add to history organized by date with timestamp
+  String historyPath = "sensors/history/" + dateOnly + "/" + String(timestamp);
   if (Firebase.RTDB.setJSON(&fbdo, historyPath.c_str(), &json)) {
     Serial.println("✓ History updated");
+    Serial.println("  PATH: " + historyPath);
   } else {
     Serial.println("✗ History FAILED");
     Serial.println("  REASON: " + fbdo.errorReason());
   }
 
-  // If fire detected, log alert
+  // If fire detected, log alert with date/time
   if (fire_alarm == 1) {
     FirebaseJson alertJson;
     alertJson.set("probability", probability);
-    alertJson.set("timestamp", timestamp);
+    alertJson.set("dateTime", dateTime);
+    alertJson.set("unixTimestamp", timestamp);
     alertJson.set("temperature", temp);
     alertJson.set("humidity", hum);
     alertJson.set("eco2", eco2);
     alertJson.set("rawH2", h2);
     alertJson.set("rawEthanol", ethanol);
     
-    String alertPath = "alerts/" + String(timestamp);
+    String alertPath = "alerts/" + dateOnly + "/" + String(timestamp);
     if (Firebase.RTDB.setJSON(&fbdo, alertPath.c_str(), &alertJson)) {
       Serial.println("🔥 FIRE ALERT LOGGED!");
+      Serial.println("  PATH: " + alertPath);
     } else {
       Serial.println("✗ Alert logging FAILED");
     }
