@@ -83,6 +83,7 @@ LiquidCrystal_I2C lcd(0x27, 16, 4);
 #define MQ8_PIN 35
 #define BUZZER_PIN 25  // Buzzer connected to GPIO 25
 #define TEST_BUTTON_PIN 32  // Push button for demo mode
+#define CALIBRATE_BUTTON_PIN 33  // Push button for calibration mode
 
 // ====== BUZZER VARIABLES ======
 bool buzzerState = false;
@@ -127,6 +128,24 @@ const float DEMO_DATA[8][7] = {
 
 const int DEMO_DATA_COUNT = 8;
 
+// ====== CALIBRATION VARIABLES ======
+bool isCalibrated = false;
+bool calibrationMode = false;
+int calibrationSampleCount = 0;
+const int CALIBRATION_SAMPLES = 20;  // Collect 20 samples over 40 seconds
+float calibrationSums[6] = {0, 0, 0, 0, 0, 0};  // Sum of samples for averaging
+float calibrationOffsets[6] = {0, 0, 0, 0, 0, 0};  // Final offset values
+
+// Original baseline from training data (fire_alarm = 0 conditions)
+const float BASELINE_MEANS[6] = {
+    594.73,      // eco2 (average of non-fire samples)
+    65.17,       // humidity
+    1006.09,     // pressure
+    2824.09,     // raw_ethanol
+    58.25,      // raw_h2
+    34.23        // temperature
+};
+
 void setup() {
   Serial.begin(115200);
   delay(1000);
@@ -144,6 +163,11 @@ void setup() {
   pinMode(TEST_BUTTON_PIN, INPUT_PULLUP);
   Serial.println("Test button initialized (GPIO 32)");
   Serial.println("Press button to start DEMO MODE with fire detection data");
+  
+  // Initialize Calibration Button Pin with internal pull-up
+  pinMode(CALIBRATE_BUTTON_PIN, INPUT_PULLUP);
+  Serial.println("Calibration button initialized (GPIO 33)");
+  Serial.println("Press and HOLD for 3 seconds to start CALIBRATION");
 
   // Initialize LCD
   lcd.init();
@@ -316,7 +340,33 @@ void setup() {
 void loop() {
   unsigned long currentMillis = millis();
   
-  // Check for button press to toggle demo mode
+  // Check for calibration button (hold for 3 seconds)
+  static unsigned long calibrateButtonPressTime = 0;
+  static bool calibrateButtonWasPressed = false;
+  bool calibrateButtonState = digitalRead(CALIBRATE_BUTTON_PIN);
+  
+  if (calibrateButtonState == LOW && !calibrateButtonWasPressed) {
+    // Button just pressed
+    calibrateButtonPressTime = currentMillis;
+    calibrateButtonWasPressed = true;
+  } else if (calibrateButtonState == LOW && calibrateButtonWasPressed) {
+    // Button still held
+    if (currentMillis - calibrateButtonPressTime >= 3000 && !calibrationMode) {
+      // Held for 3 seconds - start calibration
+      startCalibration();
+    }
+  } else if (calibrateButtonState == HIGH && calibrateButtonWasPressed) {
+    // Button released
+    calibrateButtonWasPressed = false;
+  }
+  
+  // Handle calibration process
+  if (calibrationMode) {
+    handleCalibration();
+    return;  // Skip normal operation during calibration
+  }
+  
+  // Check for test button press to toggle demo mode
   static bool lastButtonState = HIGH;
   bool currentButtonState = digitalRead(TEST_BUTTON_PIN);
   
@@ -327,10 +377,10 @@ void loop() {
     demoDataIndex = 0;
     
     if (demoMode) {
-      Serial.println("\n╔═══════════════════════════════════════╗");
-      Serial.println("║     🔥 DEMO MODE ACTIVATED 🔥         ║");
+      Serial.println("\n╔════════════════════════════════════════╗");
+      Serial.println("║    🔥 DEMO MODE ACTIVATED 🔥          ║");
       Serial.println("║  Using Pre-recorded Fire Data         ║");
-      Serial.println("╚═══════════════════════════════════════╝\n");
+      Serial.println("╚════════════════════════════════════════╝\n");
       lcd.clear();
       lcd.setCursor(0, 0);
       lcd.print("DEMO MODE");
@@ -428,6 +478,13 @@ void runInference() {
       temp_event.temperature
   };
 
+  // Apply calibration offsets if calibrated
+  if (isCalibrated) {
+    for (int i = 0; i < 6; i++) {
+      sensor_values[i] += calibrationOffsets[i];
+    }
+  }
+
   // Print sensor readings
   Serial.println("========== SENSOR READINGS ==========");
   Serial.printf("Temperature:   %.2f °C\n", sensor_values[5]);
@@ -436,6 +493,9 @@ void runInference() {
   Serial.printf("eCO2:          %.0f ppm\n", sensor_values[0]);
   Serial.printf("H2 (MQ8):      %d\n", mq8_raw);
   Serial.printf("Ethanol (MQ3): %d\n", mq3_raw);
+  if (isCalibrated) {
+    Serial.println("Status:        CALIBRATED ✓");
+  }
 
   // Standardize & Quantize
   int8_t quantized_input[6];
@@ -682,4 +742,133 @@ void runDemoInference() {
 
   // Send to Firebase (optional in demo mode - comment out if not needed)
   sendToFirebase(temp, hum, press, (int)eco2, h2, ethanol, probability, fire_alarm);
+}
+
+// ====== Start Calibration Process ======
+void startCalibration() {
+  calibrationMode = true;
+  calibrationSampleCount = 0;
+  
+  // Reset calibration sums
+  for (int i = 0; i < 6; i++) {
+    calibrationSums[i] = 0;
+  }
+  
+  // Turn off buzzer during calibration
+  fireDetected = false;
+  digitalWrite(BUZZER_PIN, LOW);
+  
+  Serial.println("\n╔═══════════════════════════════════════════════╗");
+  Serial.println("║      🔧 CALIBRATION MODE STARTED 🔧          ║");
+  Serial.println("║                                               ║");
+  Serial.println("║  Please ensure there is NO FIRE or smoke     ║");
+  Serial.println("║  in the environment.                          ║");
+  Serial.println("║                                               ║");
+  Serial.println("║  Collecting 20 samples (40 seconds)...       ║");
+  Serial.println("╚═══════════════════════════════════════════════╝\n");
+  
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("CALIBRATING...");
+  lcd.setCursor(0, 1);
+  lcd.print("No fire/smoke!");
+  lcd.setCursor(0, 2);
+  lcd.print("Wait 40 seconds");
+}
+
+// ====== Handle Calibration Process ======
+void handleCalibration() {
+  static unsigned long lastCalibrationSample = 0;
+  unsigned long currentMillis = millis();
+  
+  // Collect sample every 2 seconds
+  if (currentMillis - lastCalibrationSample >= 2000) {
+    lastCalibrationSample = currentMillis;
+    
+    // Read sensors
+    readAllSensors();
+    
+    // Add to sums
+    calibrationSums[0] += (float)ens160.getECO2();
+    calibrationSums[1] += humidity_event.relative_humidity;
+    calibrationSums[2] += pressure_event.pressure;
+    calibrationSums[3] += (float)mq3_raw;
+    calibrationSums[4] += (float)mq8_raw;
+    calibrationSums[5] += temp_event.temperature;
+    
+    calibrationSampleCount++;
+    
+    Serial.printf("Calibration sample %d/%d collected\n", 
+                  calibrationSampleCount, CALIBRATION_SAMPLES);
+    
+    // Update LCD progress
+    lcd.setCursor(0, 3);
+    lcd.print("Sample: ");
+    lcd.print(calibrationSampleCount);
+    lcd.print("/");
+    lcd.print(CALIBRATION_SAMPLES);
+    
+    // Check if calibration complete
+    if (calibrationSampleCount >= CALIBRATION_SAMPLES) {
+      completeCalibration();
+    }
+  }
+}
+
+// ====== Complete Calibration ======
+void completeCalibration() {
+  calibrationMode = false;
+  
+  // Calculate averages for current environment
+  float currentEnvironment[6];
+  for (int i = 0; i < 6; i++) {
+    currentEnvironment[i] = calibrationSums[i] / CALIBRATION_SAMPLES;
+  }
+  
+  // Calculate offsets to shift current environment to baseline
+  for (int i = 0; i < 6; i++) {
+    calibrationOffsets[i] = BASELINE_MEANS[i] - currentEnvironment[i];
+  }
+  
+  isCalibrated = true;
+  
+  Serial.println("\n╔═══════════════════════════════════════════════╗");
+  Serial.println("║      ✓ CALIBRATION COMPLETED ✓               ║");
+  Serial.println("╚═══════════════════════════════════════════════╝\n");
+  
+  Serial.println("Current Environment Baseline:");
+  Serial.printf("  eCO2:     %.1f ppm (offset: %.1f)\n", 
+                currentEnvironment[0], calibrationOffsets[0]);
+  Serial.printf("  Humidity: %.1f %% (offset: %.1f)\n", 
+                currentEnvironment[1], calibrationOffsets[1]);
+  Serial.printf("  Pressure: %.1f hPa (offset: %.1f)\n", 
+                currentEnvironment[2], calibrationOffsets[2]);
+  Serial.printf("  Ethanol:  %.0f (offset: %.0f)\n", 
+                currentEnvironment[3], calibrationOffsets[3]);
+  Serial.printf("  H2:       %.0f (offset: %.0f)\n", 
+                currentEnvironment[4], calibrationOffsets[4]);
+  Serial.printf("  Temp:     %.1f °C (offset: %.1f)\n\n", 
+                currentEnvironment[5], calibrationOffsets[5]);
+  
+  Serial.println("Device is now calibrated for this location!");
+  Serial.println("Fire detection will be more accurate.\n");
+  
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Calibration");
+  lcd.setCursor(0, 1);
+  lcd.print("Complete!");
+  lcd.setCursor(0, 2);
+  lcd.print("Device Ready");
+  
+  // Beep buzzer 3 times to confirm
+  for (int i = 0; i < 3; i++) {
+    digitalWrite(BUZZER_PIN, HIGH);
+    delay(200);
+    digitalWrite(BUZZER_PIN, LOW);
+    delay(200);
+  }
+  
+  delay(3000);
+  lcd.clear();
 }
