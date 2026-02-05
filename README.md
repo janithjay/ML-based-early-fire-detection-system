@@ -128,8 +128,8 @@ Update the Firebase configuration in `esp32.ino`:
 Adjust the timezone offset for accurate timestamps:
 
 ```cpp
-const long gmtOffset_sec = 5*3600;  // UTC+5:30 example
-const int daylightOffset_sec = 0;   // Daylight saving time offset
+const long gmtOffset_sec = 5*3600 + 30*60;  // UTC+5:30 example (19800 seconds)
+const int daylightOffset_sec = 0;           // Daylight saving time offset
 ```
 
 ## 🚀 Installation & Setup
